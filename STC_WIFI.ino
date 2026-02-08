@@ -108,7 +108,7 @@ Adafruit_AHTX0 aht20;
 #define DEBUG_PRINTF(...) do { if (isDebug) { Serial.printf(__VA_ARGS__); } } while(0)
 
 
-static const char* FW_VERSION = "KTR.2.1.1.3";
+static const char* FW_VERSION = "KTR.2.1.1.4";
 static const char* MQTT_HOST  = "iotb.kutar.com.tr";
 static const int   MQTT_PORT  = 6001;
 static const char* MQTT_USER  = "kutar";
@@ -258,6 +258,16 @@ struct SensorCache {
 SensorCache internalCache;  // Dahili sensör cache
 SensorCache eddystoneCache[32];  // Eddystone sensörler cache
 
+// Eddystone sensör anormal değer takibi
+struct EddystoneErrorTracker {
+  float lastValidTemp;      // Son geçerli sıcaklık değeri
+  uint8_t consecutiveZeros; // Ardışık 0 sayısı
+  bool hasValidValue;       // Daha önce geçerli değer geldi mi
+  uint32_t lastErrorTime;   // Son error publish zamanı (rate limit için)
+};
+
+EddystoneErrorTracker eddystoneErrorTracker[32];  // Her sensör için tracker
+
 // Cache timeout (5 dakika)
 #define CACHE_TIMEOUT_MS 600000
 
@@ -295,9 +305,13 @@ struct EddystoneSensorConfig {
   char sensorName[32];     // Sensör adı
   float tempHigh;          // Yüksek sıcaklık limiti
   float tempLow;           // Düşük sıcaklık limiti
+  float humHigh;           // Yüksek nem limiti
+  float humLow;            // Düşük nem limiti
+  float tempOffset;        // Sıcaklık offset (default: 0)
+  float humOffset;         // Nem offset (default: +18)
   bool buzzerEnabled;      // Buzzer aktif/pasif
   bool enabled;            // Sensör aktif/pasif
-  uint8_t reserved[8];     // Gelecek kullanım
+  uint8_t reserved[0];     // Gelecek kullanım (offset'ler için yer açıldı)
 
   EddystoneSensorConfig() {
     memset(macAddress, 0, sizeof(macAddress));
@@ -305,6 +319,10 @@ struct EddystoneSensorConfig {
     memset(sensorName, 0, sizeof(sensorName));
     tempHigh = 40.0f;
     tempLow = 0.0f;
+    humHigh = 60.0f;       // Default BLE nem üst limit
+    humLow = 29.0f;        // Default BLE nem alt limit
+    tempOffset = 0.0f;     // Default BLE sıcaklık offset
+    humOffset = 18.0f;     // Default BLE nem offset
     buzzerEnabled = true;
     enabled = true;
     memset(reserved, 0, sizeof(reserved));
@@ -361,8 +379,8 @@ struct SystemStatus {
 // ====== ALARM SES AYARLARI ======
 struct AlarmSoundSettings {
   char     soundProfile[16] = "medical";
-  uint32_t soundDuration    = 1200;   // 1.2 saniyelik alarm "burst"
-  uint32_t soundRepeat      = 3000;   // burst'ler arası 3 sn
+  uint32_t soundDuration    = 30000;  // 30 saniye alarm süresi
+  uint32_t soundRepeat      = 3600000; // 1 saatte bir tekrar (3600000 ms = 1 saat)
   uint8_t  soundVolume      = 80;     // %80 ses
   uint16_t soundFreq1       = 900;    // 1. ton (bip1)
   uint16_t soundFreq2       = 1200;   // 2. ton (bip2)
@@ -405,9 +423,11 @@ struct Cfg {
   // Dahili sensör alarm eşikleri
   float tempHigh = 40.0f;
   float tempLow  = 5.0f;
+  float humHigh  = 60.0f;  // Nem üst limit
+  float humLow   = 29.0f;  // Nem alt limit
 
   // Buzzer
-  bool buzzerEnabled = false;
+  bool buzzerEnabled = true;
   uint32_t buzPeriodMs = 60000;
   uint32_t buzPulseMs  = 3000;
 
@@ -449,26 +469,77 @@ struct AlarmSoundState {
   uint32_t stepTime = 0;
 } soundState;
 
-enum ScreenMode { SCR_INFO, SCR_WORK, SCR_BEACON, SCR_ALARM };
+// Alarm event sistemi - her alarm ID ile takip edilir
+struct AlarmEvent {
+  char alarmId[64];        // Unique alarm ID (örn: "INTERNAL_TH", "EDDY_<MAC>_TH")
+  bool isActive;           // Alarm aktif mi?
+  uint32_t startTime;      // Alarm başlangıç zamanı (epoch)
+  uint32_t finishTime;     // Alarm bitiş zamanı (epoch, 0 = aktif)
+  bool published;          // Bu alarm publish edildi mi?
+  uint32_t lastBuzzerTime; // Son buzzer çalma zamanı
+  uint8_t buzzerCount;     // Buzzer kaç kez çaldı (debug için)
+  
+  AlarmEvent() {
+    memset(alarmId, 0, sizeof(alarmId));
+    isActive = false;
+    startTime = 0;
+    finishTime = 0;
+    published = false;
+    lastBuzzerTime = 0;
+    buzzerCount = 0;
+  }
+};
+
+#define MAX_ALARM_EVENTS 50
+AlarmEvent alarmEvents[MAX_ALARM_EVENTS];
+uint8_t alarmEventCount = 0;
+
+// Error event sistemi - her hata için 2 kez publish limiti
+struct ErrorEvent {
+  char errorId[64];        // Unique error ID
+  uint8_t publishCount;   // Kaç kez publish edildi (max 2)
+  uint32_t lastPublishTime; // Son publish zamanı
+  
+  ErrorEvent() {
+    memset(errorId, 0, sizeof(errorId));
+    publishCount = 0;
+    lastPublishTime = 0;
+  }
+};
+
+#define MAX_ERROR_EVENTS 50
+ErrorEvent errorEvents[MAX_ERROR_EVENTS];
+uint8_t errorEventCount = 0;
+
+enum ScreenMode { SCR_INFO, SCR_WORK, SCR_BEACON, SCR_ALARM, SCR_NO_WIFI };
 ScreenMode screen = SCR_INFO;
 uint32_t showInfoUntil = 0;
 int currentSensorIndex = -1; // -1 = dahili sensör
 uint32_t lastSensorSwitch = 0;
 
 // MQTT Topic'ler
-String gTopicData, gTopicInfo, gTopicAlarm, gTopicCfg, gTopicBeacon;
+String gTopicData, gTopicInfo, gTopicAlarm, gTopicCfg, gTopicBeacon, gTopicError;
 
 // ====== FONKSİYON BİLDİRİMLERİ ======
 void i2cScan();
 void updateNetworkStatus(bool wifiOK, bool mqttOK);
 struct EddystoneBeacon* findBeaconByMac(const char* macAddress);
 bool publishSensorAlarm(const char* sensorType, const char* mahalId, const char* sensorName,
-                       const char* alarmType, float value, float threshold);
+                       const char* alarmType, float value, float threshold, const char* alarmId, bool isFinish,
+                       float tempHigh, float tempLow, float humHigh, float humLow,
+                       const char* smac, int wifiRssi, int bleRssi);
+bool publishError(const char* errorType, const char* errorMessage, const char* component);
+AlarmEvent* findOrCreateAlarmEvent(const char* alarmId);
+void activateAlarmEvent(const char* alarmId);
+void deactivateAlarmEvent(const char* alarmId, const char* sensorType, const char* mahalId, const char* sensorName,
+                         const char* alarmType, float value, float threshold);
 void cleanupOldBeacons();
 void performBLEScan();
 void drawWorkScreen();
 void drawBeaconScreen();
 void drawInfoScreen();
+void drawNoWifiScreen();
+void updateAlarmLed();
 void drawBottomBarWithMahal(const String& mahalId);
 void drawTemperatureIcon(int x, int y);
 void drawHumidityIcon(int x, int y);
@@ -500,6 +571,7 @@ String tpInfo(const String& mac)   { return "KUTARIoT/info/"   + mac; }
 String tpAlarm(const String& mac)  { return "KUTARIoT/alarm/"  + mac; }
 String tpCfg(const String& mac)    { return "KUTARIoT/config/" + mac; }
 String tpBeacon(const String& mac) { return "KUTARIoT/beacon/" + mac; }
+String tpError(const String& mac)  { return "KUTARIoT/error/"  + mac; }
 
 
 // Global değişkenler
@@ -577,38 +649,75 @@ void updateEddystoneCache() {
     
     EddystoneBeacon* b = findBeaconByMac(cfg.eddystoneSensors[i].macAddress);
     if (b && b->isValid) {
-      eddystoneCache[i].temperature  = b->temperature;
+      // Ham sıcaklık değeri (offset uygulanmadan)
+      float rawTemp = b->temperature;
+      
+      // BLE sensör offset'lerini uygula
+      eddystoneCache[i].temperature  = rawTemp + cfg.eddystoneSensors[i].tempOffset;
 
-/*/
-      // ADVCOUNT → NEM (Yalnızca 0 değilse)
+      // ADVCOUNT → NEM (advCount > 1000 ise hesapla)
       float hum = 255.0f;                    // 255 = "nem yok" sentinel
-      if (b->advCount != 0) {
+      if (b->advCount > 1000) {
         hum = (float)b->advCount / 100.0f;   // 4565 → 45.65 %RH
+        // BLE sensör nem offset'ini uygula
+        hum = hum + cfg.eddystoneSensors[i].humOffset;
       }
-      eddystoneCache[i].humidity     = hum;
-*/
-      static uint32_t lastMs = 0;
-      static float hum = 46.0f;
-
-      uint32_t now = millis();
-      if ((int32_t)(now - lastMs) >= 10000) {
-        lastMs = now;
-
-        int d = (int)(esp_random() % 61) - 30; // -0.30 .. +0.30
-        hum += d / 100.0f;
-
-        if (hum < 45.0f) hum = 45.0f;
-        if (hum > 47.0f) hum = 47.0f;
-      }
-
+      // advCount < 1000 ise nem ölçme özelliği yok, 255 kalır
       eddystoneCache[i].humidity = hum;
-
 
       eddystoneCache[i].batteryLevel = b->batteryLevel;
       eddystoneCache[i].rssi         = b->rssi;
       eddystoneCache[i].lastUpdate   = millis();
       eddystoneCache[i].sampleEpoch  = nowEpoch;
       eddystoneCache[i].isValid      = true;
+      
+      // ===== ANORMAL DEĞER KONTROLÜ =====
+      // 0 değeri kontrolü (ham değer üzerinden)
+      if (rawTemp == 0.0f) {
+        // Ardışık 0 sayısını artır
+        eddystoneErrorTracker[i].consecutiveZeros++;
+        
+        // Eğer daha önce geçerli bir değer geldiyse (birden 0'a düşüş)
+        if (eddystoneErrorTracker[i].hasValidValue && eddystoneErrorTracker[i].consecutiveZeros == 1) {
+          // Birden 0'a düşüş error'u
+          uint32_t now = millis();
+          // Rate limit: 5 dakikada bir
+          if (now - eddystoneErrorTracker[i].lastErrorTime > 300000) {
+            char errorMsg[128];
+            snprintf(errorMsg, sizeof(errorMsg), 
+                    "BLE Eddystone sensör sıcaklık değeri aniden 0'a düştü. Son geçerli değer: %.2f°C", 
+                    eddystoneErrorTracker[i].lastValidTemp);
+            publishError("EDDYSTONE_TEMP_ZERO_DROP", errorMsg, cfg.eddystoneSensors[i].sensorName);
+            eddystoneErrorTracker[i].lastErrorTime = now;
+            DEBUG_PRINTF("[ERROR] %s - Birden 0'a düşüş: %.2f -> 0\n", 
+                        cfg.eddystoneSensors[i].sensorName, eddystoneErrorTracker[i].lastValidTemp);
+          }
+        }
+        
+        // 10 kez üst üste 0 gelirse error
+        if (eddystoneErrorTracker[i].consecutiveZeros >= 10) {
+          uint32_t now = millis();
+          // Rate limit: 5 dakikada bir
+          if (now - eddystoneErrorTracker[i].lastErrorTime > 300000) {
+            char errorMsg[128];
+            snprintf(errorMsg, sizeof(errorMsg), 
+                    "BLE Eddystone sensör %d kez üst üste 0 değeri gönderdi", 
+                    eddystoneErrorTracker[i].consecutiveZeros);
+            publishError("EDDYSTONE_TEMP_ZERO_REPEAT", errorMsg, cfg.eddystoneSensors[i].sensorName);
+            eddystoneErrorTracker[i].lastErrorTime = now;
+            DEBUG_PRINTF("[ERROR] %s - %d kez üst üste 0 değeri\n", 
+                        cfg.eddystoneSensors[i].sensorName, eddystoneErrorTracker[i].consecutiveZeros);
+          }
+        }
+      } else {
+        // Geçerli değer geldi
+        if (rawTemp != 255.0f && !isnan(rawTemp)) {
+          eddystoneErrorTracker[i].lastValidTemp = rawTemp;
+          eddystoneErrorTracker[i].hasValidValue = true;
+        }
+        // Ardışık 0 sayısını sıfırla
+        eddystoneErrorTracker[i].consecutiveZeros = 0;
+      }
     }
   }
 }
@@ -1020,16 +1129,44 @@ void setAlarmLedNormal() {
   alarmLed.show();
 }
 
-// Alarm aktifken → kırmızı yanıp sönme (buzzer pattern ile kullanacağız)
-void pulseAlarmLed() {
-  static bool on = false;
-  on = !on;
-
-  if (on) {
-    alarmLed.fill(alarmLed.Color(255, 0, 0));  // kırmızı
-  } else {
-    alarmLed.clear();  // sön
+// Alarm aktifken → kırmızı yanıp sönme (loop içinde periyodik çağrılmalı)
+void updateAlarmLed() {
+  // Aktif alarm var mı kontrol et
+  bool hasActiveAlarm = false;
+  for (int i = 0; i < alarmEventCount; i++) {
+    if (alarmEvents[i].isActive) {
+      hasActiveAlarm = true;
+      break;
+    }
   }
+  
+  if (hasActiveAlarm) {
+    // Alarm var - LED'i kırmızı yanıp sön yap
+    static uint32_t lastToggle = 0;
+    static bool on = false;
+    uint32_t now = millis();
+    
+    if (now - lastToggle >= 500) {  // 500ms'de bir toggle
+      on = !on;
+      lastToggle = now;
+
+      if (on) {
+        alarmLed.fill(alarmLed.Color(255, 0, 0));  // kırmızı
+      } else {
+        alarmLed.clear();  // sön
+      }
+      alarmLed.show();
+    }
+  } else {
+    // Alarm yok - normal mavi
+    setAlarmLedNormal();
+  }
+}
+
+// Eski fonksiyon - geriye uyumluluk için
+void pulseAlarmLed() {
+  // Artık updateAlarmLed() kullanılıyor, bu fonksiyon sadece ilk çağrı için
+  alarmLed.fill(alarmLed.Color(255, 0, 0));  // kırmızı
   alarmLed.show();
 }
 
@@ -1064,54 +1201,33 @@ void initAlarmLed() {
 
 
 // ====== BUZZER ======
-void buzzerOn()  { if (!cfg.buzzerEnabled) return; ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_ON); ledc_update_duty(LEDC_MODE, LEDC_CHANNEL); }
-void buzzerOff() { if (!cfg.buzzerEnabled) return; ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);            ledc_update_duty(LEDC_MODE, LEDC_CHANNEL); }
+// ====== BUZZER (Basit HIGH/LOW) ======
+void buzzerOn() {
+  if (!cfg.buzzerEnabled) return;
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void buzzerOff() {
+  if (!cfg.buzzerEnabled) return;
+  digitalWrite(BUZZER_PIN, LOW);
+}
 
 void buzzerInit() {
   DEBUG_PRINTLN("[BUZZER] Başlatılıyor...");
-  ledc_timer_config_t timer_config = {
-    .speed_mode = LEDC_MODE,
-    .duty_resolution = LEDC_RES,
-    .timer_num = LEDC_TIMER,
-    .freq_hz = 1000,
-    .clk_cfg = LEDC_AUTO_CLK
-  };
-  esp_err_t e1 = ledc_timer_config(&timer_config);
-  ledc_channel_config_t channel_config = {
-    .gpio_num = BUZZER_PIN,
-    .speed_mode = LEDC_MODE,
-    .channel = LEDC_CHANNEL,
-    .intr_type = LEDC_INTR_DISABLE,
-    .timer_sel = LEDC_TIMER,
-    .duty = 0,
-    .hpoint = 0
-  };
-  esp_err_t e2 = ledc_channel_config(&channel_config);
-  if (e1 != ESP_OK || e2 != ESP_OK) {
-    DEBUG_PRINTF("[BUZZER] Hata! timer=%d, ch=%d\n", e1, e2);
-    cfg.buzzerEnabled = false;
-  } else {
-    DEBUG_PRINTLN("[BUZZER] OK");
-    buzzerOn(); delay(100); buzzerOff();
-  }
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  DEBUG_PRINTLN("[BUZZER] OK");
+  // Test bip
+  buzzerOn(); delay(100); buzzerOff();
 }
 
-// Seçilen frekans ve volume ile buzzer çal
-// Frekansı yumuşak kaydır (sweep) yapan sürücü
-static void buzzerSetSweep(uint16_t fStart, uint16_t fEnd, uint8_t volumePct, uint16_t stepTimeMs)
-{
-  if (!cfg.buzzerEnabled) { buzzerOff(); return; }
-  if (volumePct > 100) volumePct = 100;
-
-  uint32_t duty = (LEDC_DUTY_ON * volumePct) / 100;
-
-  int step = (fEnd > fStart) ? 10 : -10;   // adım 10 Hz
-  for (int f = fStart; (step > 0 ? f <= fEnd : f >= fEnd); f += step) {
-    ledc_set_freq(LEDC_MODE, LEDC_TIMER, f);
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    delay(stepTimeMs);
-  }
+// Açılış tonu - basit iki bip
+static void playStartupTone() {
+  if (!cfg.buzzerEnabled) return;
+  buzzerOn(); delay(150);
+  buzzerOff(); delay(50);
+  buzzerOn(); delay(150);
+  buzzerOff();
 }
 
 
@@ -1791,11 +1907,13 @@ void drawWorkScreen() {
   // ===============================
   else {
     int activeIdx = 0;
+    bool foundValidSensor = false;
+    
+    // Önce mevcut sensörü kontrol et
     for (int i = 0; i < 32; i++) {
       if (!cfg.eddystoneSensors[i].enabled) continue;
 
       if (activeIdx == currentSensorIndex) {
-
         mahalId  = String(cfg.eddystoneSensors[i].mahalId);
         tempHigh = cfg.eddystoneSensors[i].tempHigh;
         tempLow  = cfg.eddystoneSensors[i].tempLow;
@@ -1805,15 +1923,72 @@ void drawWorkScreen() {
           hum       = eddystoneCache[i].humidity;
           valueValid = true;
 
-          // ADVCOUNT’tan türetilmiş nem varsa göster
-          if (hum < 254.0f) hasHumidity = true;
+          // advCount > 1000 ise nem var (hum < 255.0f)
+          if (hum < 255.0f) hasHumidity = true;
           else hasHumidity = false;
-        } else {
-          hasHumidity = false;
+          
+          foundValidSensor = true;
         }
         break;
       }
       activeIdx++;
+    }
+    
+    // Eğer mevcut sensör verisi yoksa, sonraki geçerli sensöre geç
+    if (!foundValidSensor) {
+      activeIdx = 0;
+      int nextValidIdx = -1;
+      
+      // Mevcut sensörden sonraki geçerli sensörü bul
+      for (int i = 0; i < 32; i++) {
+        if (!cfg.eddystoneSensors[i].enabled) continue;
+        
+        if (activeIdx > currentSensorIndex && isCacheValid(eddystoneCache[i])) {
+          nextValidIdx = activeIdx;
+          mahalId  = String(cfg.eddystoneSensors[i].mahalId);
+          tempHigh = cfg.eddystoneSensors[i].tempHigh;
+          tempLow  = cfg.eddystoneSensors[i].tempLow;
+          temp     = eddystoneCache[i].temperature;
+          hum      = eddystoneCache[i].humidity;
+          valueValid = true;
+          
+          // advCount > 1000 ise nem var (hum < 255.0f)
+          if (hum < 255.0f) hasHumidity = true;
+          else hasHumidity = false;
+          
+          // currentSensorIndex'i güncelle
+          currentSensorIndex = nextValidIdx;
+          break;
+        }
+        activeIdx++;
+      }
+      
+      // Eğer sonraki sensör bulunamadıysa, baştan başla
+      if (nextValidIdx == -1) {
+        activeIdx = 0;
+        for (int i = 0; i < 32; i++) {
+          if (!cfg.eddystoneSensors[i].enabled) continue;
+          
+          if (isCacheValid(eddystoneCache[i])) {
+            nextValidIdx = activeIdx;
+            mahalId  = String(cfg.eddystoneSensors[i].mahalId);
+            tempHigh = cfg.eddystoneSensors[i].tempHigh;
+            tempLow  = cfg.eddystoneSensors[i].tempLow;
+            temp     = eddystoneCache[i].temperature;
+            hum      = eddystoneCache[i].humidity;
+            valueValid = true;
+            
+            // advCount > 1000 ise nem var (hum < 255.0f)
+            if (hum < 255.0f) hasHumidity = true;
+            else hasHumidity = false;
+            
+            // currentSensorIndex'i güncelle
+            currentSensorIndex = nextValidIdx;
+            break;
+          }
+          activeIdx++;
+        }
+      }
     }
   }
 
@@ -1853,10 +2028,11 @@ void drawWorkScreen() {
   tft.setCursor(textX, textY);
 
   if (!valueValid || temp == 255.0f) {  
-    // ❌ HATA DURUMU
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
-    tft.print("WAIT..");
+    // ❌ HATA DURUMU - Ekranda gösterme, sadece error publish et
+    if (temp == 255.0f && mqtt.connected()) {
+      publishError("SENSOR_READ_ERROR", "Temperature sensor read failed", "AHT20");
+    }
+    // Ekranda hiçbir şey gösterme, boş bırak
   } else {
     // ✔ NORMAL
     tft.setTextColor(tempColor, ST77XX_BLACK);
@@ -1884,13 +2060,11 @@ void drawWorkScreen() {
     tft.setTextSize(4);
 
     if (!valueValid || hum == 255.0f) {
-      // ❌ HATA DURUMU
-      tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
-      tft.print("WAIT..");
-      tft.setTextSize(3);
-      tft.setCursor(textX + 120, contentY + 76);
-      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-      tft.print("%");
+      // ❌ HATA DURUMU - Ekranda gösterme, sadece error publish et
+      if (hum == 255.0f && mqtt.connected()) {
+        publishError("SENSOR_READ_ERROR", "Humidity sensor read failed", "AHT20");
+      }
+      // Ekranda hiçbir şey gösterme, boş bırak
     } else {
       // ✔ NORMAL
       tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
@@ -2053,21 +2227,27 @@ void drawInfoScreen() {
   drawLine("MQTT", mqttVal, mqttColor);
 
   // AHT20
-  String ahtVal = aht20_ok ? "OK" : "WAIT..";
-  uint16_t ahtColor = aht20_ok ? ST77XX_GREEN : ST77XX_RED;
-  drawLine("AHT20", ahtVal, ahtColor);
+  if (aht20_ok) {
+    drawLine("AHT20", "OK", ST77XX_GREEN);
+  } else {
+    // AHT20 çalışmıyorsa error publish et ve ekranda gösterme
+    if (mqtt.connected()) {
+      publishError("SENSOR_INIT_ERROR", "AHT20 sensor initialization failed", "AHT20");
+    }
+    // Ekranda gösterme
+  }
 
   // BLE
-  String bleVal;
-  uint16_t bleColor;
   if (sysStatus.bleOK) {
-    bleVal = "OK (" + String(beaconCount) + " beacon)";
-    bleColor = ST77XX_GREEN;
+    String bleVal = "OK (" + String(beaconCount) + " beacon)";
+    drawLine("BLE", bleVal, ST77XX_GREEN);
   } else {
-    bleVal = "WAIT..";
-    bleColor = ST77XX_RED;
+    // BLE çalışmıyorsa error publish et ve ekranda gösterme
+    if (mqtt.connected()) {
+      publishError("BLE_INIT_ERROR", "BLE initialization failed", "BLE");
+    }
+    // Ekranda gösterme
   }
-  drawLine("BLE", bleVal, bleColor);
 
   // Sensör sayısı
   String sensVal = "1 Dahili + " + String(cfg.activeSensorCount);
@@ -2096,6 +2276,70 @@ void drawInfoScreen() {
   tft.setTextColor(STATUS_FG, STATUS_BG);
 }
 #endif
+
+#ifdef USE_LCD_ST7789
+void drawNoWifiScreen() {
+  if (!lcd_ok) return;
+  
+  tft.fillScreen(ST77XX_BLACK);
+  
+  // --- Gradient arka plan (showBootScreen'e benzer) ---
+  for (int y = 0; y < SCREEN_H; y++) {
+    uint8_t c = map(y, 0, SCREEN_H, 0, 80);
+    uint16_t color = tft.color565(0, c, c*1.2);
+    tft.drawFastHLine(0, y, SCREEN_W, color);
+  }
+  
+  tft.setTextWrap(false);
+  
+  // =========================
+  //   WiFi İkonu (Kırmızı)
+  // =========================
+  int iconX = SCREEN_W / 2;
+  int iconY = SCREEN_H / 2 - 40;
+  
+  // Basit WiFi ikonu çiz (kırmızı)
+  tft.drawCircle(iconX, iconY, 15, ST77XX_RED);
+  tft.drawCircle(iconX, iconY, 10, ST77XX_RED);
+  tft.fillCircle(iconX, iconY, 3, ST77XX_RED);
+  
+  // =========================
+  //   Mesaj
+  // =========================
+  tft.setFont(&FreeSans12pt7b);
+  tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+  
+  String msg1 = "NETWORK YOK";
+  String msg2 = "Lutfen Destek";
+  String msg3 = "Talep Ediniz...";
+  
+  int16_t x1, y1;
+  uint16_t w, h;
+  
+  // Mesaj 1
+  tft.getTextBounds(msg1, 0, 0, &x1, &y1, &w, &h);
+  int msgX = (SCREEN_W - w) / 2;
+  int msgY = iconY + 50;
+  drawTextTr(msgX, msgY, msg1);
+  
+  // Mesaj 2
+  tft.setFont(&FreeSans9pt7b);
+  tft.getTextBounds(msg2, 0, 0, &x1, &y1, &w, &h);
+  msgX = (SCREEN_W - w) / 2;
+  msgY += h + 10;
+  drawTextTr(msgX, msgY, msg2);
+  
+  // Mesaj 3
+  tft.getTextBounds(msg3, 0, 0, &x1, &y1, &w, &h);
+  msgX = (SCREEN_W - w) / 2;
+  msgY += h + 5;
+  drawTextTr(msgX, msgY, msg3);
+  
+  tft.setFont();
+  tft.setTextSize(1);
+}
+#endif
+
 // VBAT ölçümü — kalibreli (0 gelme sorununu düzeltir)
 // BATTERY_PIN senin dosyada #define olarak zaten varsa tekrar TANIMLAMA.
 static float _readBatteryVolts() {
@@ -2170,30 +2414,185 @@ void setAlarmState(bool active, const char* reason=nullptr) {
   }
 }
 
+// Helper: Alarm event bul veya oluştur
+AlarmEvent* findOrCreateAlarmEvent(const char* alarmId) {
+  // Önce mevcut event'i bul
+  for (int i = 0; i < alarmEventCount; i++) {
+    if (strcmp(alarmEvents[i].alarmId, alarmId) == 0) {
+      return &alarmEvents[i];
+    }
+  }
+  
+  // Bulunamadı, yeni oluştur
+  if (alarmEventCount < MAX_ALARM_EVENTS) {
+    strlcpy(alarmEvents[alarmEventCount].alarmId, alarmId, sizeof(alarmEvents[alarmEventCount].alarmId));
+    alarmEventCount++;
+    return &alarmEvents[alarmEventCount - 1];
+  }
+  
+  return nullptr;  // Yer yok
+}
+
+// Helper: Error event bul veya oluştur
+ErrorEvent* findOrCreateErrorEvent(const char* errorId) {
+  // Önce mevcut event'i bul
+  for (int i = 0; i < errorEventCount; i++) {
+    if (strcmp(errorEvents[i].errorId, errorId) == 0) {
+      return &errorEvents[i];
+    }
+  }
+  
+  // Bulunamadı, yeni oluştur
+  if (errorEventCount < MAX_ERROR_EVENTS) {
+    strlcpy(errorEvents[errorEventCount].errorId, errorId, sizeof(errorEvents[errorEventCount].errorId));
+    errorEventCount++;
+    return &errorEvents[errorEventCount - 1];
+  }
+  
+  return nullptr;  // Yer yok
+}
+
+// Alarm event'i aktif et
+void activateAlarmEvent(const char* alarmId) {
+  AlarmEvent* evt = findOrCreateAlarmEvent(alarmId);
+  if (evt && !evt->isActive) {
+    evt->isActive = true;
+    evt->startTime = unixEpoch();
+    evt->finishTime = 0;
+    evt->published = false;
+    evt->lastBuzzerTime = 0;
+    evt->buzzerCount = 0;
+    DEBUG_PRINTF("[ALARM-EVENT] BAŞLADI: %s @ %u\n", alarmId, evt->startTime);
+  }
+}
+
+// Alarm event'i deaktif et
+void deactivateAlarmEvent(const char* alarmId, const char* sensorType, const char* mahalId, const char* sensorName,
+                         const char* alarmType, float value, float threshold) {
+  AlarmEvent* evt = findOrCreateAlarmEvent(alarmId);
+  if (evt && evt->isActive) {
+    evt->isActive = false;
+    evt->finishTime = unixEpoch();
+    uint32_t duration = evt->finishTime - evt->startTime;
+    DEBUG_PRINTF("[ALARM-EVENT] BİTTİ: %s @ %u (süre: %u sn)\n", alarmId, evt->finishTime, duration);
+    
+    // Eğer daha önce publish edildiyse, finish mesajı gönder
+    if (evt->published && mqtt.connected()) {
+      publishSensorAlarm(sensorType, mahalId, sensorName, alarmType, value, threshold, alarmId, true,
+                       0.0f, 0.0f, 0.0f, 0.0f, nullptr, -127, -127);
+    }
+  }
+}
+
 bool publishSensorAlarm(const char* sensorType, const char* mahalId, const char* sensorName,
-                       const char* alarmType, float value, float threshold) {
+                       const char* alarmType, float value, float threshold, const char* alarmId, bool isFinish,
+                       float tempHigh, float tempLow, float humHigh, float humLow,
+                       const char* smac, int wifiRssi, int bleRssi) {
   if (!mqtt.connected()) return false;
-  DynamicJsonDocument doc(1024);
+  
+  // Alarm event'i bul
+  AlarmEvent* evt = findOrCreateAlarmEvent(alarmId);
+  if (!evt) return false;
+  
+  // Eğer finish değilse ve daha önce publish edildiyse, tekrar publish etme
+  if (!isFinish && evt->published && evt->isActive) {
+    return true;  // Zaten publish edilmiş
+  }
+  
+  DynamicJsonDocument doc(2048);
   doc["msg"] = "alarm";
+  doc["alarmId"] = alarmId;
   doc["sensorType"] = sensorType;
   doc["mahalId"] = mahalId;
   doc["sensorName"] = sensorName;
   doc["atype"] = alarmType;
   doc["value"] = value;
   doc["threshold"] = threshold;
-  doc["ts"] = unixEpoch();
+  doc["Stime"] = evt->startTime;
+  doc["Ftime"] = evt->finishTime;
   doc["gmac"] = gMacUpper;
-  // Elektrik / şarj durumu
-  JsonObject power = doc.createNestedObject("power");
-  power["mains"]    = gPower.mainsPresent;
-  power["charging"] = gPower.charging;
-  power["vbat"]     = gPower.vbat;
-  power["battPct"]  = gPower.battPct;
-  power["powerCut"] = !gPower.mainsPresent;
+  
+  // Limit değerleri
+  doc["tempHigh"] = tempHigh;
+  doc["tempLow"] = tempLow;
+  doc["humHigh"] = humHigh;
+  doc["humLow"] = humLow;
+  
+  // RSSI bilgileri
+  JsonObject rssi = doc.createNestedObject("rssi");
+  rssi["wifi"] = wifiRssi;
+  rssi["ble"] = bleRssi;
+  
+  // Eddystone sensörler için smac
+  if (smac) {
+    doc["smac"] = smac;
+  }
+  
+  // Power bilgileri (sadece power alarmı için veya tüm alarmlarda)
+  if (strcmp(alarmType, "PO") == 0 || strcmp(alarmType, "PF") == 0) {
+    JsonObject power = doc.createNestedObject("power");
+    power["mains"] = gPower.mainsPresent;
+    power["charging"] = gPower.charging;
+    power["vbat"] = gPower.vbat;
+    power["battPct"] = gPower.battPct;
+    power["powerCut"] = !gPower.mainsPresent;
+    power["power"] = gPower.mainsPresent ? "on" : "off";
+  }
 
   String payload; serializeJson(doc, payload);
   bool ok = mqtt.publish(gTopicAlarm.c_str(), payload.c_str(), false);
-  DEBUG_PRINTF("[ALARM] %s - %s: %s\n", sensorName, alarmType, ok ? "OK" : "FAIL");
+  
+  if (ok) {
+    evt->published = true;
+    DEBUG_PRINTF("[ALARM] %s - %s: OK (ID: %s, %s)\n", sensorName, alarmType, alarmId, isFinish ? "FINISH" : "START");
+  } else {
+    DEBUG_PRINTF("[ALARM] %s - %s: FAIL\n", sensorName, alarmType);
+  }
+  
+  return ok;
+}
+
+// Error publish fonksiyonu
+bool publishError(const char* errorType, const char* errorMessage, const char* component) {
+  if (!mqtt.connected()) return false;
+  
+  // Error event'i bul veya oluştur
+  ErrorEvent* evt = findOrCreateErrorEvent(errorType);
+  if (!evt) return false;
+  
+  // Maksimum 2 kez publish et
+  if (evt->publishCount >= 2) {
+    return true;  // Zaten 2 kez publish edilmiş
+  }
+  
+  DynamicJsonDocument doc(1024);
+  doc["msg"] = "error";
+  doc["errorType"] = errorType;
+  doc["errorMessage"] = errorMessage;
+  doc["component"] = component;
+  doc["timestamp"] = unixEpoch();
+  doc["gmac"] = gMacUpper;
+  
+  // Sistem durumu
+  JsonObject system = doc.createNestedObject("system");
+  system["wifiOK"] = sysStatus.wifiOK;
+  system["mqttOK"] = sysStatus.mqttOK;
+  system["aht20OK"] = aht20_ok;
+  system["bleOK"] = sysStatus.bleOK;
+  system["uptime"] = millis() / 1000;
+  system["heap"] = ESP.getFreeHeap();
+  
+  String payload; serializeJson(doc, payload);
+  bool ok = mqtt.publish(gTopicError.c_str(), payload.c_str(), false);
+  
+  if (ok) {
+    evt->publishCount++;
+    evt->lastPublishTime = millis();
+    DEBUG_PRINTF("[ERROR] %s - %s: OK (count: %d/2)\n", errorType, errorMessage, evt->publishCount);
+  } else {
+    DEBUG_PRINTF("[ERROR] %s - %s: FAIL\n", errorType, errorMessage);
+  }
+  
   return ok;
 }
 
@@ -2202,17 +2601,17 @@ void playCurrentAlarmSound()
   uint32_t now = millis();
   uint32_t elapsed = now - soundState.stepTime;
 
-  // 1 döngü toplam süresi (1.2 saniye)
+  // Basit pattern: 300ms on, 300ms off, 600ms silent
   const uint32_t cycle = 1200;
   uint32_t t = elapsed % cycle;
 
   if (t < 300) {
-    // 0–300ms : sweep 900 → 1200 Hz
-    buzzerSetSweep(900, 1200, cfg.alarmSound.soundVolume, 5);
+    // 0–300ms : ON
+    buzzerOn();
   }
   else if (t < 600) {
-    // 300–600ms: sweep 1200 → 900 Hz
-    buzzerSetSweep(1200, 900, cfg.alarmSound.soundVolume, 5);
+    // 300–600ms: OFF
+    buzzerOff();
   }
   else {
     // 600–1200ms sessizlik
@@ -3484,8 +3883,15 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   initAlarmLed();
+  
+  // Buzzer init ve startup tone
+  buzzerInit();
+  playStartupTone();
 
   loadConfig();
+  
+  // Eddystone error tracker initialize
+  memset(eddystoneErrorTracker, 0, sizeof(eddystoneErrorTracker));
   printConfig();
 
   initOfflineBuffer();
@@ -3496,6 +3902,7 @@ void setup() {
   gTopicAlarm  = tpAlarm(gMacUpper);
   gTopicCfg    = tpCfg(gMacUpper);
   gTopicBeacon = tpBeacon(gMacUpper);
+  gTopicError  = tpError(gMacUpper);
   //gTopicOffline = "KUTARIoT/offline/" + gMacUpper;
 
   DEBUG_PRINTF("[SETUP] Device MAC: %s\n", gMacUpper.c_str());
@@ -3528,7 +3935,11 @@ void setup() {
   }
 
   buzzerInit();
+  playStartupTone();  // Açılış tonu
   initBLE();
+  
+  // Eddystone error tracker initialize
+  memset(eddystoneErrorTracker, 0, sizeof(eddystoneErrorTracker));
 
   // 1. WiFi Bağlantısı (NTP olmadan)
   DEBUG_PRINTF("[WIFI] Bağlanıyor: %s\n", cfg.wifiSsid);
@@ -3550,9 +3961,13 @@ void setup() {
   if (lcd_ok) updateNetworkStatus(sysStatus.wifiOK, sysStatus.mqttOK);
 #endif
 
-
-  screen = SCR_INFO;
-  showInfoUntil = millis() + 10000;  // İstersen bunu da silebilirsin artık
+  // WiFi bağlı değilse SCR_NO_WIFI ekranını göster
+  if (WiFi.status() != WL_CONNECTED) {
+    screen = SCR_NO_WIFI;
+  } else {
+    screen = SCR_INFO;
+    showInfoUntil = millis() + 10000;  // İstersen bunu da silebilirsin artık
+  }
 
   DEBUG_PRINTLN("[SETUP] === Sistem Durumu ===");
   DEBUG_PRINTF("WiFi: %s\n", sysStatus.wifiOK ? "OK" : "FAIL");
@@ -3624,117 +4039,356 @@ void tryReconnectWiFi() {
 // ====== ÇOK-SENSÖR ALARM KONTROL ======
 void handleMultiSensorAlarm() {
   static uint32_t lastAlarmCheck = 0;
-  if (millis() - lastAlarmCheck < 1000) return;   // 1 sn’de bir kontrol
+  if (millis() - lastAlarmCheck < 1000) return;   // 1 sn'de bir kontrol
   lastAlarmCheck = millis();
 
   // --- Publish rate-limit için state'ler ---
-  static bool     lastInternalAlarm          = false;
-  static uint32_t lastInternalPublishMs      = 0;
-  static bool     lastEddystoneAlarm[32]     = {0};
-  static uint32_t lastEddystonePublishMs[32] = {0};
+  static bool     lastInternalTempAlarm     = false;
+  static bool     lastInternalHumAlarm      = false;
+  static bool     lastPowerAlarm            = false;
+  static bool     lastBatteryAlarm          = false;
+  static bool     lastEddystoneAlarm[32]    = {0};
+  static bool     lastEddystoneHumAlarm[32] = {0};
+  static bool     lastEddystoneBattAlarm[32] = {0};
 
   uint32_t now = millis();
-  uint32_t alarmPeriod = cfg.dataPeriod;   // default: 120000 ms (2 dk)
+  updatePowerStatus();  // Güç durumunu güncelle
 
   bool anyAlarm = false;
 
-  // ===== 1) DAHİLİ SENSÖR =====
+  // ===== 1) DAHİLİ SENSÖR - SICAKLIK =====
   float t = readTemperature();
-
-  // 255 veya NaN ölçümlerde ALARM YOK
-  bool internalAlarm = false;
+  bool internalTempAlarm = false;
   if (!isnan(t) && t != 255.0f) {
-    internalAlarm = (t > cfg.tempHigh || t < cfg.tempLow);
-  }
+    internalTempAlarm = (t > cfg.tempHigh || t < cfg.tempLow);
 
-  if (internalAlarm) {
-    anyAlarm = true;
-    const char* reason = (t > cfg.tempHigh) ? "TEMP_HIGH" : "TEMP_LOW";
-
-    //DEBUG_PRINTF("[ALARM] Dahili: %s (%.1fC)\n", reason, t);
-
-    if (mqtt.connected()) {
-      bool shouldPublish = false;
-
-      if (!lastInternalAlarm) {
-        // normalden → alarma geçiş
-        shouldPublish = true;
-      } else if (now - lastInternalPublishMs >= alarmPeriod) {
-        // Sürekli alarm devam ediyor ama 2 dk geçti
-        shouldPublish = true;
-      }
-
-      if (shouldPublish) {
+    if (internalTempAlarm) {
+      anyAlarm = true;
+      const char* reason = (t > cfg.tempHigh) ? "TH" : "TL";  // TEMP_HIGH -> TH, TEMP_LOW -> TL
+      char alarmId[64];
+      // Aynı alarm tipi için aynı ID kullan (timestamp yok)
+      snprintf(alarmId, sizeof(alarmId), "INTERNAL_%s", reason);
+      
+      activateAlarmEvent(alarmId);
+      
+      if (!lastInternalTempAlarm && mqtt.connected()) {
         publishSensorAlarm(
           "INTERNAL",
           cfg.internalMahalId,
           cfg.internalSensorName,
           reason,
           t,
-          (t > cfg.tempHigh) ? cfg.tempHigh : cfg.tempLow
+          (t > cfg.tempHigh) ? cfg.tempHigh : cfg.tempLow,
+          alarmId,
+          false,
+          cfg.tempHigh,
+          cfg.tempLow,
+          0.0f,
+          0.0f,
+          nullptr,
+          readWifiRSSI(),
+          -127
         );
-        lastInternalPublishMs = now;
       }
+    } else {
+      // Alarm bitti - INTERNAL alarm event'lerini deaktif et
+      char alarmId[64];
+      snprintf(alarmId, sizeof(alarmId), "INTERNAL_TH");
+      deactivateAlarmEvent(alarmId, "INTERNAL", cfg.internalMahalId, cfg.internalSensorName, "TEMP_HIGH", t, cfg.tempHigh);
+      snprintf(alarmId, sizeof(alarmId), "INTERNAL_TL");
+      deactivateAlarmEvent(alarmId, "INTERNAL", cfg.internalMahalId, cfg.internalSensorName, "TEMP_LOW", t, cfg.tempLow);
     }
   }
+  lastInternalTempAlarm = internalTempAlarm;
 
-  // Son state'i güncelle
-  lastInternalAlarm = internalAlarm;
+  // ===== 2) DAHİLİ SENSÖR - NEM =====
+  float h = readHumidity();
+  bool internalHumAlarm = false;
+  if (!isnan(h) && h != 255.0f) {
+    internalHumAlarm = (h > cfg.humHigh || h < cfg.humLow);
+    
+    if (internalHumAlarm) {
+      anyAlarm = true;
+      const char* reason = (h > cfg.humHigh) ? "HH" : "HL";  // HUM_HIGH -> HH, HUM_LOW -> HL
+      char alarmId[64];
+      // Aynı alarm tipi için aynı ID kullan (timestamp yok)
+      snprintf(alarmId, sizeof(alarmId), "INTERNAL_%s", reason);
+      
+      activateAlarmEvent(alarmId);
+      
+      if (!lastInternalHumAlarm && mqtt.connected()) {
+        publishSensorAlarm(
+          "INTERNAL",
+          cfg.internalMahalId,
+          cfg.internalSensorName,
+          reason,
+          h,
+          (h > cfg.humHigh) ? cfg.humHigh : cfg.humLow,
+          alarmId,
+          false,
+          0.0f,
+          0.0f,
+          cfg.humHigh,
+          cfg.humLow,
+          nullptr,
+          readWifiRSSI(),
+          -127
+        );
+      }
+    } else {
+      // Alarm bitti - INTERNAL nem alarm event'lerini deaktif et
+      char alarmId[64];
+      snprintf(alarmId, sizeof(alarmId), "INTERNAL_HH");
+      deactivateAlarmEvent(alarmId, "INTERNAL", cfg.internalMahalId, cfg.internalSensorName, "HUM_HIGH", h, cfg.humHigh);
+      snprintf(alarmId, sizeof(alarmId), "INTERNAL_HL");
+      deactivateAlarmEvent(alarmId, "INTERNAL", cfg.internalMahalId, cfg.internalSensorName, "HUM_LOW", h, cfg.humLow);
+    }
+  }
+  lastInternalHumAlarm = internalHumAlarm;
 
-  // ===== 2) EDDYSTONE SENSÖRLER =====
+  // ===== 3) EDDYSTONE SENSÖRLER - SICAKLIK =====
   for (int i = 0; i < 32; i++) {
     if (!cfg.eddystoneSensors[i].enabled) continue;
 
-    EddystoneBeacon* b = findBeaconByMac(cfg.eddystoneSensors[i].macAddress);
-    if (!b || !b->isValid) continue;
-
+    if (!isCacheValid(eddystoneCache[i])) continue;
+    
+    float temp = eddystoneCache[i].temperature;
     // 255 ölçüm geldiyse bu beacon için alarm hesaplama
-    if (b->temperature == 255.0f || isnan(b->temperature)) {
-      lastEddystoneAlarm[i] = false;   // state'i de temiz tutalım
+    if (temp == 255.0f || isnan(temp)) {
+      lastEddystoneAlarm[i] = false;
       continue;
     }
 
-    bool alarm = (b->temperature > cfg.eddystoneSensors[i].tempHigh ||
-                  b->temperature < cfg.eddystoneSensors[i].tempLow);
+    bool tempAlarm = (temp > cfg.eddystoneSensors[i].tempHigh ||
+                      temp < cfg.eddystoneSensors[i].tempLow);
 
-    if (alarm) {
+    if (tempAlarm) {
       anyAlarm = true;
-      const char* reason = (b->temperature > cfg.eddystoneSensors[i].tempHigh) ? "TEMP_HIGH" : "TEMP_LOW";
-
-      DEBUG_PRINTF("[ALARM] Beacon: %s (%.1fC) - %s\n", reason, b->temperature, cfg.eddystoneSensors[i].sensorName);
-
-      if (mqtt.connected()) {
-        bool shouldPublish = false;
-
-        if (!lastEddystoneAlarm[i]) {
-          // İlk kez alarma geçti
-          shouldPublish = true;
-        } else if (now - lastEddystonePublishMs[i] >= alarmPeriod) {
-          // Alarm devam ediyor ama en az 2 dk geçti
-          shouldPublish = true;
-        }
-
-        if (shouldPublish) {
-          publishSensorAlarm(
-            "EDDYSTONE",
-            cfg.eddystoneSensors[i].mahalId,
-            cfg.eddystoneSensors[i].sensorName,
-            reason,
-            b->temperature,
-            (b->temperature > cfg.eddystoneSensors[i].tempHigh)
-              ? cfg.eddystoneSensors[i].tempHigh
-              : cfg.eddystoneSensors[i].tempLow
-          );
-          lastEddystonePublishMs[i] = now;
-        }
+      const char* reason = (temp > cfg.eddystoneSensors[i].tempHigh) ? "TH" : "TL";
+      char alarmId[64];
+      // Aynı sensör ve alarm tipi için aynı ID kullan (MAC + tip)
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_%s", cfg.eddystoneSensors[i].macAddress, reason);
+      
+      activateAlarmEvent(alarmId);
+      
+      if (!lastEddystoneAlarm[i] && mqtt.connected()) {
+        publishSensorAlarm(
+          "EDDYSTONE",
+          cfg.eddystoneSensors[i].mahalId,
+          cfg.eddystoneSensors[i].sensorName,
+          reason,
+          temp,
+          (temp > cfg.eddystoneSensors[i].tempHigh)
+            ? cfg.eddystoneSensors[i].tempHigh
+            : cfg.eddystoneSensors[i].tempLow,
+          alarmId,
+          false,
+          cfg.eddystoneSensors[i].tempHigh,
+          cfg.eddystoneSensors[i].tempLow,
+          0.0f,
+          0.0f,
+          cfg.eddystoneSensors[i].macAddress,
+          readWifiRSSI(),
+          eddystoneCache[i].rssi
+        );
       }
+    } else {
+      // Alarm bitti - bu sensör için alarm event'lerini deaktif et
+      char alarmId[64];
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_TH", cfg.eddystoneSensors[i].macAddress);
+      deactivateAlarmEvent(alarmId, "EDDYSTONE", cfg.eddystoneSensors[i].mahalId, cfg.eddystoneSensors[i].sensorName, 
+                          "TEMP_HIGH", temp, cfg.eddystoneSensors[i].tempHigh);
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_TL", cfg.eddystoneSensors[i].macAddress);
+      deactivateAlarmEvent(alarmId, "EDDYSTONE", cfg.eddystoneSensors[i].mahalId, cfg.eddystoneSensors[i].sensorName, 
+                          "TEMP_LOW", temp, cfg.eddystoneSensors[i].tempLow);
     }
 
-    // O beacon için son state’i güncelle
-    lastEddystoneAlarm[i] = alarm;
+    lastEddystoneAlarm[i] = tempAlarm;
   }
 
-  // Genel alarm state'i (buzzer + ekran için) aynen devam
+  // ===== 4) EDDYSTONE SENSÖRLER - NEM =====
+  for (int i = 0; i < 32; i++) {
+    if (!cfg.eddystoneSensors[i].enabled) continue;
+    
+    if (!isCacheValid(eddystoneCache[i])) continue;
+    
+    float h = eddystoneCache[i].humidity;
+    if (isnan(h) || h == 255.0f) continue;
+    
+    bool humAlarm = (h > cfg.eddystoneSensors[i].humHigh || h < cfg.eddystoneSensors[i].humLow);
+    
+    if (humAlarm) {
+      anyAlarm = true;
+      const char* reason = (h > cfg.eddystoneSensors[i].humHigh) ? "HH" : "HL";
+      char alarmId[64];
+      // Aynı sensör ve alarm tipi için aynı ID kullan (MAC + tip)
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_%s", cfg.eddystoneSensors[i].macAddress, reason);
+      
+      activateAlarmEvent(alarmId);
+      
+      if (!lastEddystoneHumAlarm[i] && mqtt.connected()) {
+        publishSensorAlarm(
+          "EDDYSTONE",
+          cfg.eddystoneSensors[i].mahalId,
+          cfg.eddystoneSensors[i].sensorName,
+          reason,
+          h,
+          (h > cfg.eddystoneSensors[i].humHigh) ? cfg.eddystoneSensors[i].humHigh : cfg.eddystoneSensors[i].humLow,
+          alarmId,
+          false,
+          0.0f,
+          0.0f,
+          cfg.eddystoneSensors[i].humHigh,
+          cfg.eddystoneSensors[i].humLow,
+          cfg.eddystoneSensors[i].macAddress,
+          readWifiRSSI(),
+          eddystoneCache[i].rssi
+        );
+      }
+      lastEddystoneHumAlarm[i] = true;
+    } else {
+      // Alarm bitti - bu sensör için nem alarm event'lerini deaktif et
+      char alarmId[64];
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_HH", cfg.eddystoneSensors[i].macAddress);
+      deactivateAlarmEvent(alarmId, "EDDYSTONE", cfg.eddystoneSensors[i].mahalId, cfg.eddystoneSensors[i].sensorName, 
+                          "HUM_HIGH", h, cfg.eddystoneSensors[i].humHigh);
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_HL", cfg.eddystoneSensors[i].macAddress);
+      deactivateAlarmEvent(alarmId, "EDDYSTONE", cfg.eddystoneSensors[i].mahalId, cfg.eddystoneSensors[i].sensorName, 
+                          "HUM_LOW", h, cfg.eddystoneSensors[i].humLow);
+      
+      lastEddystoneHumAlarm[i] = false;
+    }
+  }
+
+  // ===== 5) AC GÜÇ ALARMI =====
+  static bool lastMainsState = true;
+  bool currentMainsState = gPower.mainsPresent;
+  
+  if (currentMainsState != lastMainsState) {
+    anyAlarm = true;
+    const char* reason = currentMainsState ? "PO" : "PF";  // POWER_ON -> PO, POWER_OFF -> PF
+    char alarmId[64] = "POWER_PF";  // POWER_OFF için sabit ID
+    
+    if (!currentMainsState) {
+      // Güç kesildi
+      activateAlarmEvent(alarmId);
+      if (!lastPowerAlarm && mqtt.connected()) {
+        publishSensorAlarm(
+          "SYSTEM",
+          cfg.internalMahalId,
+          cfg.internalSensorName,
+          reason,
+          0.0f,
+          0.0f,
+          alarmId,
+          false,
+          0.0f,
+          0.0f,
+          0.0f,
+          0.0f,
+          nullptr,
+          readWifiRSSI(),
+          -127
+        );
+      }
+      lastPowerAlarm = true;
+    } else {
+      // Güç geldi - POWER alarm event'ini deaktif et
+      char alarmId[64] = "POWER_PF";
+      deactivateAlarmEvent(alarmId, "SYSTEM", cfg.internalMahalId, cfg.internalSensorName, "POWER_OFF", 0.0f, 0.0f);
+      lastPowerAlarm = false;
+    }
+    lastMainsState = currentMainsState;
+  }
+
+  // ===== 6) GATEWAY BATARYA ALARMI =====
+  bool batteryAlarm = (gPower.battPct < 10);
+  
+  if (batteryAlarm) {
+    anyAlarm = true;
+    char alarmId[64] = "BATTERY_BL";  // BATTERY_LOW için sabit ID
+    
+    activateAlarmEvent(alarmId);
+    
+    if (!lastBatteryAlarm && mqtt.connected()) {
+      publishSensorAlarm(
+        "SYSTEM",
+        cfg.internalMahalId,
+        cfg.internalSensorName,
+        "BATTERY_LOW",
+        (float)gPower.battPct,
+        10.0f,
+        alarmId,
+        false,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        nullptr,
+        readWifiRSSI(),
+        -127
+      );
+    }
+    lastBatteryAlarm = true;
+  } else {
+    // Alarm bitti - BATTERY alarm event'ini deaktif et
+    char alarmId[64] = "BATTERY_BL";
+    deactivateAlarmEvent(alarmId, "SYSTEM", cfg.internalMahalId, cfg.internalSensorName, "BATTERY_LOW", (float)gPower.battPct, 10.0f);
+    lastBatteryAlarm = false;
+  }
+
+  // ===== 7) EDDYSTONE SENSÖR BATARYA ALARMI =====
+  // CR2450 için %10 altı = 2.1V altı (2100 mV altı)
+  for (int i = 0; i < 32; i++) {
+    if (!cfg.eddystoneSensors[i].enabled) continue;
+    
+    EddystoneBeacon* b = findBeaconByMac(cfg.eddystoneSensors[i].macAddress);
+    if (!b || !b->isValid) continue;
+    
+    // Batarya voltajı kontrol et (mV cinsinden)
+    bool eddystoneBattAlarm = (b->batteryLevel > 0 && b->batteryLevel < 2100);  // 2.1V = 2100mV
+    
+    if (eddystoneBattAlarm) {
+      anyAlarm = true;
+      char alarmId[64];
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_BL", cfg.eddystoneSensors[i].macAddress);
+      
+      activateAlarmEvent(alarmId);
+      
+      if (!lastEddystoneBattAlarm[i] && mqtt.connected()) {
+        // Voltajı V cinsine çevir (mV -> V)
+        float battVoltage = (float)b->batteryLevel / 1000.0f;
+        publishSensorAlarm(
+          "EDDYSTONE",
+          cfg.eddystoneSensors[i].mahalId,
+          cfg.eddystoneSensors[i].sensorName,
+          "BATTERY_LOW",
+          battVoltage,
+          2.1f,  // Threshold: 2.1V
+          alarmId,
+          false,
+          0.0f,
+          0.0f,
+          0.0f,
+          0.0f,
+          cfg.eddystoneSensors[i].macAddress,
+          readWifiRSSI(),
+          b->rssi
+        );
+      }
+      lastEddystoneBattAlarm[i] = true;
+    } else {
+      // Alarm bitti - EDDYSTONE batarya alarm event'ini deaktif et
+      char alarmId[64];
+      snprintf(alarmId, sizeof(alarmId), "EDDY_%s_BL", cfg.eddystoneSensors[i].macAddress);
+      float battVoltage = (float)b->batteryLevel / 1000.0f;
+      deactivateAlarmEvent(alarmId, "EDDYSTONE", cfg.eddystoneSensors[i].mahalId, cfg.eddystoneSensors[i].sensorName, 
+                          "BATTERY_LOW", battVoltage, 2.1f);
+      lastEddystoneBattAlarm[i] = false;
+    }
+  }
+
+  // Genel alarm state'i (buzzer + ekran için)
   setAlarmState(anyAlarm, anyAlarm ? "MULTI_SENSOR_ALARM" : nullptr);
 }
 
@@ -3777,6 +4431,10 @@ void loop() {
 
   // 3. Buzzer tick
   buzzerTick();
+  
+  // 3.5. Alarm LED güncelleme
+  updateAlarmLed();
+  
   RST_WDT();
 
   // 4. WiFi/MQTT bağlantı kontrolü (15 saniyede bir) - NON-BLOCKING
@@ -3793,14 +4451,24 @@ void loop() {
       if (!sysStatus.wifiOK) {
         sysStatus.wifiOK = true;
         DEBUG_PRINTLN("[LOOP] WiFi yeniden bağlandı");
+        // WiFi bağlandıktan sonra hemen NTP sync yap
+        syncTimeViaNTP();
+        updateTimeSync();
       }
     } else {
       if (sysStatus.wifiOK) {
         sysStatus.wifiOK = false;
         sysStatus.mqttOK = false;
         DEBUG_PRINTLN("[LOOP] WiFi bağlantısı koptu");
+        // WiFi koptuğunda SCR_NO_WIFI ekranına geç
+        screen = SCR_NO_WIFI;
       }
       tryReconnectWiFi();  // Uzun bloklamasın
+    }
+    
+    // WiFi bağlı değilse SCR_NO_WIFI ekranında kal
+    if (WiFi.status() != WL_CONNECTED) {
+      screen = SCR_NO_WIFI;
     }
 
     // ---- MQTT durumu ----
@@ -3855,6 +4523,18 @@ void loop() {
   }
 
   RST_WDT();
+  
+  // 10.5. AHT20 ve BLE error kontrolü (periyodik)
+  static uint32_t tErrorCheck = 0;
+  if (elapsed(now, tErrorCheck, 30000)) {  // 30 saniyede bir
+    tErrorCheck = now;
+    if (!aht20_ok && mqtt.connected()) {
+      publishError("SENSOR_INIT_ERROR", "AHT20 sensor initialization failed", "AHT20");
+    }
+    if (!sysStatus.bleOK && cfg.beacon.enabled && mqtt.connected()) {
+      publishError("BLE_INIT_ERROR", "BLE initialization failed", "BLE");
+    }
+  }
 
   // 11. Cache güncelleme (10 saniyede bir)
   if (elapsed(now, tCache, CACHE_INTERVAL)) {
@@ -3874,6 +4554,12 @@ void loop() {
     }
 
     RST_WDT();
+    
+    // WiFi bağlı değilse SCR_NO_WIFI ekranını göster
+    if (WiFi.status() != WL_CONNECTED) {
+      screen = SCR_NO_WIFI;
+    }
+    
     switch (screen) {
       case SCR_WORK:
         drawWorkScreen();
@@ -3883,6 +4569,9 @@ void loop() {
         break;
       case SCR_INFO:
         drawInfoScreen();
+        break;
+      case SCR_NO_WIFI:
+        drawNoWifiScreen();
         break;
       default:
         drawWorkScreen();
